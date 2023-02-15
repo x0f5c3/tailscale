@@ -70,12 +70,12 @@ jobs:
       run: ./tool/go build -o /tmp/testwrapper ./cmd/testwrapper
     - name: test all
       if: matrix.variant != 'race'
-      run: ./tool/go test -exec=/tmp/testwrapper -bench=. -benchtime=1x ./...
+      run: PATH=$PWD/tool:$PATH /tmp/testwrapper ./... -bench=. -benchtime=1x
       env:
         GOARCH: ${{ matrix.goarch }}
     - name: test all (race)
       if: matrix.variant == 'race'
-      run: ./tool/go test -race -exec=/tmp/testwrapper -bench=. -benchtime=1x ./...
+      run: PATH=$PWD/tool:$PATH /tmp/testwrapper ./... -race -bench=. -benchtime=1x
       env:
         GOARCH: ${{ matrix.goarch }}
     - name: check that no tracked files changed
