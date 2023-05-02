@@ -26,6 +26,7 @@ import (
 	"net/netip"
 	"os/exec"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -71,6 +72,11 @@ func init() {
 const (
 	perClientSendQueueDepth = 32 // packets buffered for sending
 	writeTimeout            = 2 * time.Second
+	// TODO: How long should the below be?
+	// How often to check for and free inactive flows
+	flowsCleanInterval = 10 * time.Second
+	// How long a flow can be inactive before it is freed
+	flowsInactiveTime = 5 * time.Second
 )
 
 // dupPolicy is a temporary (2021-08-30) mechanism to change the policy
@@ -87,6 +93,15 @@ const (
 	// then disables all of them.
 	disableFighters
 )
+
+// flowStats tracks statitics for a client to client data flow through
+// this server. The counters are written solely by run(), read by the
+// debug server, and do not need to be thread-safe.
+type flowStats struct {
+	bytes      int64
+	packets    int64
+	lastActive time.Time
+}
 
 type align64 [0]atomic.Int64 // for side effect of its 64-bit alignment
 
@@ -162,6 +177,14 @@ type Server struct {
 	// src.
 	sentTo map[key.NodePublic]map[key.NodePublic]int64 // src => dst => dst's latest sclient.connNum
 
+	// flows is a map of all active flowStats on the server,
+	// protected by s.mu(). After allocation by the server,
+	// flowStats are updated and deleted by the sclient read
+	// loop.
+	flows map[*sclient]map[key.NodePublic]map[key.NodePublic]*flowStats // sclient => dst => mesh peer if any => flow stats
+
+	// flowsTimer signals when it is time to free inactive flows
+	flowsTimer *time.Timer
 	// maps from netip.AddrPort to a client's public key
 	keyOfAddr map[netip.AddrPort]key.NodePublic
 }
@@ -281,6 +304,7 @@ func (s *dupClientSet) removeClient(c *sclient) bool {
 type PacketForwarder interface {
 	ForwardPacket(src, dst key.NodePublic, payload []byte) error
 	String() string
+	ServerPublicKey() key.NodePublic
 }
 
 // Conn is the subset of the underlying net.Conn the DERP Server needs.
@@ -317,6 +341,7 @@ func NewServer(privateKey key.NodePrivate, logf logger.Logf) *Server {
 		sentTo:               map[key.NodePublic]map[key.NodePublic]int64{},
 		avgQueueDuration:     new(uint64),
 		tcpRtt:               metrics.LabelMap{Label: "le"},
+		flows:                map[*sclient]map[key.NodePublic]map[key.NodePublic]*flowStats{},
 		keyOfAddr:            map[netip.AddrPort]key.NodePublic{},
 	}
 	s.initMetacert()
@@ -333,6 +358,8 @@ func NewServer(privateKey key.NodePrivate, logf logger.Logf) *Server {
 	}
 	s.packetsDroppedTypeDisco = s.packetsDroppedType.Get("disco")
 	s.packetsDroppedTypeOther = s.packetsDroppedType.Get("other")
+
+	s.flowsTimer = time.AfterFunc(flowsCleanInterval, s.flowsTimerFunc)
 	return s
 }
 
@@ -585,6 +612,8 @@ func (s *Server) unregisterClient(c *sclient) {
 		}
 	}
 
+	delete(s.flows, c)
+
 	if c.canMesh {
 		delete(s.watchers, c)
 	}
@@ -704,6 +733,7 @@ func (s *Server) accept(ctx context.Context, nc Conn, brw *bufio.ReadWriter, rem
 		peerGone:       make(chan peerGoneMsg),
 		canMesh:        clientInfo.MeshKey != "" && clientInfo.MeshKey == s.meshKey,
 		peerGoneLim:    rate.NewLimiter(rate.Every(time.Second), 3),
+		flows:          make(map[key.NodePublic]map[key.NodePublic]*flowStats),
 	}
 
 	if c.canMesh {
@@ -781,6 +811,51 @@ func (c *sclient) run(ctx context.Context) error {
 		}
 		if err != nil {
 			return err
+		}
+		c.cleanFlows()
+	}
+}
+
+// flowsTimerFunc tells all the sclients to scan for inactive flows
+// and free them.
+func (s *Server) flowsTimerFunc() {
+	s.mu.Lock()
+	for c := range s.flows {
+		c.flowsCleanNow = true
+	}
+	s.mu.Unlock()
+	s.flowsTimer = time.AfterFunc(flowsCleanInterval, s.flowsTimerFunc)
+}
+
+// cleanFlows scans all the flows for this sclient and frees any that
+// have been inactive for more than flowsCleanInterval.
+func (c *sclient) cleanFlows() {
+	if !c.flowsCleanNow {
+		return
+	}
+	c.flowsCleanNow = false
+	// TODO: Convert to c.debug() before committing
+	c.logf("cleaning flows for client %v", c.key.ShortString())
+	now := time.Now()
+	s := c.s
+	for dstKey, meshMap := range c.flows {
+		for srcOrFwd, flow := range meshMap {
+			if now.Sub(flow.lastActive) > flowsInactiveTime {
+				// TODO: Convert to c.debug() before committing
+				c.logf("deleting flow[%v][%v]", dstKey.ShortString(), srcOrFwd.ShortString())
+				// If this is the only entry for dstKey, delete the whole map
+				if len(c.flows[dstKey]) == 1 {
+					delete(c.flows, dstKey)
+					s.mu.Lock()
+					delete(s.flows[c], dstKey)
+					s.mu.Unlock()
+				} else {
+					delete(c.flows[dstKey], srcOrFwd)
+					s.mu.Lock()
+					delete(s.flows[c][dstKey], srcOrFwd)
+					s.mu.Unlock()
+				}
+			}
 		}
 	}
 }
@@ -888,8 +963,14 @@ func (c *sclient) handleFrameForwardPacket(ft frameType, fl uint32) error {
 
 	var dstLen int
 	var dst *sclient
+	var flow *flowStats
+
+	if _, ok := c.flows[dstKey]; ok {
+		flow = c.flows[dstKey][srcKey]
+	}
 
 	s.mu.Lock()
+
 	if set, ok := s.clients[dstKey]; ok {
 		dstLen = set.Len()
 		dst = set.ActiveClient()
@@ -897,7 +978,13 @@ func (c *sclient) handleFrameForwardPacket(ft frameType, fl uint32) error {
 	if dst != nil {
 		s.notePeerSendLocked(srcKey, dst)
 	}
+	if flow == nil {
+		flow = c.getFlowStatsLocked(dstKey, srcKey)
+	}
+
 	s.mu.Unlock()
+
+	c.updateFlowStats(flow, dstKey, srcKey, contents)
 
 	if dst == nil {
 		reason := dropReasonUnknownDestOnFwd
@@ -931,6 +1018,48 @@ func (s *Server) notePeerSendLocked(src key.NodePublic, dst *sclient) {
 	m[dst.key] = dst.connNum
 }
 
+// getFlowLocked allocates a flowStats to track bytes/packets sent in
+// the flow identified by this dstKey and srcOrFwd. It should only be called when
+// the flowStat for this connection does not yet exist.
+func (c *sclient) getFlowStatsLocked(dstKey, srcOrFwd key.NodePublic) *flowStats {
+	s := c.s
+	// Allocate the map for all flows associated with this sclient
+	// if necessary
+	if _, ok := s.flows[c]; !ok {
+		s.flows[c] = make(map[key.NodePublic]map[key.NodePublic]*flowStats)
+	}
+	// Allocate the map for all flows to this destination if necessary
+	if _, ok := s.flows[c][dstKey]; !ok {
+		s.flows[c][dstKey] = make(map[key.NodePublic]*flowStats)
+	}
+	// TODO: for development, remove before committing
+	if _, ok := s.flows[c][dstKey][srcOrFwd]; ok {
+		s.logf("[unexpected] flowStat already allocated for s.flows[%v(%v)][%v][%v]",
+			c.key.ShortString(), c.connNum, dstKey.ShortString(), srcOrFwd.ShortString())
+	}
+	f := flowStats{}
+	s.flows[c][dstKey][srcOrFwd] = &f
+	// Populate the sclient's flow cache outside the lock
+	return &f
+}
+
+// updateFlowStats tracks every byte that enters the derp for a
+// src,dst,connNum tuple. f must be the valid flow, either looked up from the src
+// client's flows or recently allocated and stored only in the server
+// flow map.
+func (c *sclient) updateFlowStats(f *flowStats, dstKey, srcOrFwd key.NodePublic, contents []byte) {
+	if _, ok := c.flows[dstKey]; !ok {
+		c.flows[dstKey] = make(map[key.NodePublic]*flowStats)
+	}
+	if _, ok := c.flows[dstKey][srcOrFwd]; !ok {
+		// We didn't populate this inside s.mu() so do it now
+		c.flows[dstKey][srcOrFwd] = f
+	}
+	f.packets += 1
+	f.bytes += int64(len(contents))
+	f.lastActive = time.Now()
+}
+
 // handleFrameSendPacket reads a "send packet" frame from the client.
 func (c *sclient) handleFrameSendPacket(ft frameType, fl uint32) error {
 	s := c.s
@@ -943,8 +1072,11 @@ func (c *sclient) handleFrameSendPacket(ft frameType, fl uint32) error {
 	var fwd PacketForwarder
 	var dstLen int
 	var dst *sclient
+	var fwdKey key.NodePublic
+	var flow *flowStats
 
 	s.mu.Lock()
+
 	if set, ok := s.clients[dstKey]; ok {
 		dstLen = set.Len()
 		dst = set.ActiveClient()
@@ -953,8 +1085,20 @@ func (c *sclient) handleFrameSendPacket(ft frameType, fl uint32) error {
 		s.notePeerSendLocked(c.key, dst)
 	} else if dstLen < 1 {
 		fwd = s.clientsMesh[dstKey]
+		fwdKey = fwd.ServerPublicKey()
 	}
+
 	s.mu.Unlock()
+
+	if _, ok := c.flows[dstKey]; ok {
+		flow = c.flows[dstKey][fwdKey]
+	}
+	if flow == nil {
+		s.mu.Lock()
+		flow = c.getFlowStatsLocked(dstKey, fwdKey)
+		s.mu.Unlock()
+	}
+	c.updateFlowStats(flow, dstKey, fwdKey, contents)
 
 	if dst == nil {
 		if fwd != nil {
@@ -1248,6 +1392,7 @@ func (s *Server) recvPacket(br *bufio.Reader, frameLen uint32) (dstKey key.NodeP
 	}
 	s.packetsRecv.Add(1)
 	s.bytesRecv.Add(int64(len(contents)))
+
 	if disco.LooksLikeDiscoWrapper(contents) {
 		s.packetsRecvDisco.Add(1)
 	} else {
@@ -1327,6 +1472,17 @@ type sclient struct {
 	// client that it's trying to establish a direct connection
 	// through us with a peer we have no record of.
 	peerGoneLim *rate.Limiter
+
+	// flows is a cache of the subset of flows statistics for
+	// which this client is either the src or the mesh peer
+	// forwarding for the src. The flowStats fields are changed by
+	// only the sclient read loop, but the flowStats must be
+	// allocated by the server.
+	flows map[key.NodePublic]map[key.NodePublic]*flowStats
+
+	// flowsCleanNow is set by the server to indicate it is time
+	// for this sclient to look for and free inactive flows.
+	flowsCleanNow bool
 }
 
 // peerConnState represents whether a peer is connected to the server
@@ -1758,6 +1914,10 @@ func (f *multiForwarder) String() string {
 	return fmt.Sprintf("<MultiForwarder fwd=%s total=%d>", f.fwd.Load(), len(f.all))
 }
 
+func (f *multiForwarder) ServerPublicKey() key.NodePublic {
+	return f.fwd.Load().ServerPublicKey()
+}
+
 func (s *Server) expVarFunc(f func() any) expvar.Func {
 	return expvar.Func(func() any {
 		s.mu.Lock()
@@ -1929,6 +2089,111 @@ func (s *Server) ServeDebugTraffic(w http.ResponseWriter, r *http.Request) {
 		}
 		time.Sleep(minTimeBetweenLogs)
 	}
+}
+
+// takeFlowsSnapshot returns a map of copies of all the flowStats for
+// this server. The output should be suitable for comparing the stats
+// for a specific flow at multiple points in time so that we can
+// calculate the bandwidth used.
+func (s *Server) takeFlowsSnapshot() map[*sclient]map[key.NodePublic]map[key.NodePublic]flowStats {
+	snap := make(map[*sclient]map[key.NodePublic]map[key.NodePublic]flowStats)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for c := range s.flows {
+		snap[c] = make(map[key.NodePublic]map[key.NodePublic]flowStats)
+		for dstKey := range s.flows[c] {
+			snap[c][dstKey] = make(map[key.NodePublic]flowStats)
+			for srcOrFwd := range s.flows[c][dstKey] {
+				snap[c][dstKey][srcOrFwd] = *s.flows[c][dstKey][srcOrFwd]
+			}
+		}
+	}
+	return snap
+}
+
+// ServeFlows prints a list of recently active data flows through
+// this server, including the bandwidth used by each over the last
+// second.
+func (s *Server) ServeFlows(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintf(w, "current time: %s\n", time.Now().Format("2006-01-02 15:04:05"))
+
+	lastTime := time.Now()
+	lastSnap := s.takeFlowsSnapshot()
+	time.Sleep(1 * time.Second)
+	currTime := time.Now()
+	currSnap := s.takeFlowsSnapshot()
+	dur := currTime.Sub(lastTime)
+
+	type flowLine struct {
+		connNum         int64
+		src, dst        key.NodePublic
+		fwdTo, recvFrom key.NodePublic
+		bytes           int64
+		packets         int64
+		bps             int64
+		pps             int64
+		lastActive      time.Duration
+	}
+
+	// Copy current flow snapshot into a sortable slice of flowLines
+	lines := make([]flowLine, 0)
+	for c := range currSnap {
+		for dstKey := range currSnap[c] {
+			for srcOrFwd := range currSnap[c][dstKey] {
+				f := currSnap[c][dstKey][srcOrFwd]
+				l := flowLine{
+					connNum:    c.connNum,
+					dst:        dstKey,
+					bytes:      f.bytes,
+					packets:    f.packets,
+					lastActive: currTime.Sub(f.lastActive),
+				}
+				// Calculate bandwidth
+				last := flowStats{}
+				if _, ok := lastSnap[c]; ok {
+					if _, ok2 := lastSnap[c][dstKey]; ok2 {
+						last = lastSnap[c][dstKey][srcOrFwd]
+					}
+				}
+				bytes := l.bytes - last.bytes
+				packets := l.packets - last.packets
+				l.bps = int64(float64(bytes) / dur.Seconds())
+				l.pps = int64(float64(packets) / dur.Seconds())
+				// src and mesh take a lil calculation
+				if srcOrFwd == (key.NodePublic{}) {
+					// common case, src and dst local
+					l.src = c.key
+				} else {
+					// one of src or dst is remote
+					if c.canMesh {
+						// dst is local, src is remote
+						l.recvFrom = c.key
+						l.src = srcOrFwd
+					} else {
+						// src is local, dst is remote
+						l.fwdTo = srcOrFwd
+						l.src = c.key
+					}
+				}
+				lines = append(lines, l)
+			}
+		}
+	}
+
+	fmt.Fprintf(w, "number flows: %v\n", len(lines))
+	// Sort by highest bandwidth flow
+	sort.Slice(lines, func(i, j int) bool { return lines[i].bps > lines[j].bps })
+
+	headStr := "%-10v %-10v %-10v %-10v %-10v %10v %10v %10v %10v %-12v\n"
+	bodyStr := "%-10v %-10v %-10v %-10v %-10v %10v %10v %10v %10v %5v secs\n"
+	fmt.Fprintf(w, headStr, "conn#", "src", "dst", "recv from", "fwded to", "bytes", "packets", "bps", "pps", "last active")
+	for _, l := range lines {
+		fmt.Fprintf(w, bodyStr, l.connNum, l.src.ShortString(), l.dst.ShortString(), l.recvFrom.ShortString(), l.fwdTo.ShortString(), l.bytes, l.packets, l.bps, l.pps, int(l.lastActive.Seconds()))
+	}
+
+	w.(http.Flusher).Flush()
 }
 
 var bufioWriterPool = &sync.Pool{
