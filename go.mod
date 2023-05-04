@@ -20,7 +20,7 @@ require (
 	github.com/dave/jennifer v1.6.1
 	github.com/dblohm7/wingoes v0.0.0-20230426155039-111c8c3b57c8
 	github.com/dsnet/try v0.0.3
-	github.com/evanw/esbuild v0.14.53
+	github.com/evanw/esbuild v0.17.18
 	github.com/frankban/quicktest v1.14.5
 	github.com/fxamacker/cbor/v2 v2.4.0
 	github.com/go-json-experiment/json v0.0.0-20230321051131-ccbac49a6929
