@@ -5,7 +5,6 @@ package syncs
 
 import (
 	"context"
-	"sync"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -120,21 +119,77 @@ func TestMap(t *testing.T) {
 
 	t.Run("LoadOrStore", func(t *testing.T) {
 		var m Map[string, string]
-		var wg sync.WaitGroup
-		wg.Add(2)
+		var wg WaitGroup
 		var ok1, ok2 bool
-		go func() {
-			defer wg.Done()
-			_, ok1 = m.LoadOrStore("", "")
-		}()
-		go func() {
-			defer wg.Done()
-			_, ok2 = m.LoadOrStore("", "")
-		}()
+		wg.Go(func() { _, ok1 = m.LoadOrStore("", "") })
+		wg.Go(func() { _, ok2 = m.LoadOrStore("", "") })
 		wg.Wait()
-
 		if ok1 == ok2 {
 			t.Errorf("exactly one LoadOrStore should load")
+		}
+	})
+
+	t.Run("RangeMutable", func(t *testing.T) {
+		var m Map[string, string]
+		m.Store("hello", "goodbye")
+		m.Store("fizz", "buzz")
+
+		var wg WaitGroup
+		defer wg.Wait()
+		wg.Go(func() { m.Load("hello") })
+		wg.Go(func() { m.Store("hello", "goodbye") })
+		wg.Go(func() { m.LoadOrStore("hello", "goodbye") })
+		wg.Go(func() { m.LoadAndDelete("noexist") })
+		wg.Go(func() { m.Delete("noexist") })
+		wg.Go(func() { m.Range(func(k, v string) bool { return true }) })
+		wg.Go(func() { m.Len() })
+		wg.Go(func() {
+			m.RangeMutable(func(m *Map[string, string], k, v string) bool {
+				if v2, ok := m.Load(k); v != v2 || !ok {
+					t.Errorf("Load = (%v, %v), want (%v, %v)", v2, ok, v, true)
+				}
+				m.Store(k, v)
+				if v2, ok := m.LoadOrStore(k, v); v != v2 || !ok {
+					t.Errorf("LoadOrStore = (%v, %v), want (%v, %v)", v2, ok, v, true)
+				}
+				if v2, ok := m.LoadAndDelete("noexist"); v2 != "" || ok {
+					t.Errorf("LoadAndDelete = (%v, %v), want (%v, %v)", v2, ok, "", false)
+				}
+				m.Delete("noexist")
+				m.Range(func(k, v string) bool { return true })
+				m.RangeMutable(func(m *Map[string, string], k, v string) bool {
+					m.Store(k, v)
+					return true
+				})
+				if got, want := m.Len(), 2; got != want {
+					t.Errorf("Len = %d, want %d", got, want)
+				}
+				return true
+			})
+		})
+	})
+
+	t.Run("RangeDelete", func(t *testing.T) {
+		var m Map[int, int]
+		for i := 0; i < 10; i++ {
+			m.Store(i, i)
+		}
+
+		m.RangeMutable(func(m *Map[int, int], k, v int) bool {
+			if k%2 == 0 {
+				m.Delete(k)
+			}
+			return true
+		})
+
+		got := map[int]int{}
+		want := map[int]int{1: 1, 3: 3, 5: 5, 7: 7, 9: 9}
+		m.Range(func(k, v int) bool {
+			got[k] = v
+			return true
+		})
+		if d := cmp.Diff(got, want); d != "" {
+			t.Errorf("Range mismatch (-got +want):\n%s", d)
 		}
 	})
 }

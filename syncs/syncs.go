@@ -160,20 +160,29 @@ func (s Semaphore) Release() {
 // at a relatively high frequency.
 // This must not be shallow copied.
 type Map[K comparable, V any] struct {
+	// alreadyLocked reports whether a write-lock is already held.
+	// If so, we avoid acquiring any locks on mu.
+	// This is used by RangeMutable to allow mutations during iteration.
+	alreadyLocked bool
+
 	mu sync.RWMutex
 	m  map[K]V
 }
 
 func (m *Map[K, V]) Load(key K) (value V, ok bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	if !m.alreadyLocked {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+	}
 	value, ok = m.m[key]
 	return value, ok
 }
 
 func (m *Map[K, V]) Store(key K, value V) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	if !m.alreadyLocked {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+	}
 	mak.Set(&m.m, key, value)
 }
 
@@ -182,8 +191,10 @@ func (m *Map[K, V]) LoadOrStore(key K, value V) (actual V, loaded bool) {
 		return actual, loaded
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	if !m.alreadyLocked {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+	}
 	actual, loaded = m.m[key]
 	if !loaded {
 		actual = value
@@ -193,8 +204,10 @@ func (m *Map[K, V]) LoadOrStore(key K, value V) (actual V, loaded bool) {
 }
 
 func (m *Map[K, V]) LoadAndDelete(key K) (value V, loaded bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	if !m.alreadyLocked {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+	}
 	value, loaded = m.m[key]
 	if loaded {
 		delete(m.m, key)
@@ -203,16 +216,22 @@ func (m *Map[K, V]) LoadAndDelete(key K) (value V, loaded bool) {
 }
 
 func (m *Map[K, V]) Delete(key K) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	if !m.alreadyLocked {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+	}
 	delete(m.m, key)
 }
 
-// Range iterates over the map in undefined order calling f for each entry.
+// Range iterates over the map in an undefined order calling f for each entry.
 // Iteration stops if f returns false. Map changes are blocked during iteration.
+// Use the [RangeMutable] method instead to mutate the map during iteration.
+// A read lock is held for the entire duration of the iteration.
 func (m *Map[K, V]) Range(f func(key K, value V) bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	if !m.alreadyLocked {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+	}
 	for k, v := range m.m {
 		if !f(k, v) {
 			return
@@ -220,10 +239,31 @@ func (m *Map[K, V]) Range(f func(key K, value V) bool) {
 	}
 }
 
+// RangeMutable iterates over the map in an undefined order calling f for each entry.
+// Iteration stops if f returns false. Map changes are permitted during iteration,
+// but must be performed synchronously on m2 during the RangeMutable call.
+// A reference to m2 must not kept be beyond the life of a RangeMutable call.
+// A write lock is held for the entire duration of the iteration.
+func (m *Map[K, V]) RangeMutable(f func(m2 *Map[K, V], key K, value V) bool) {
+	if !m.alreadyLocked {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+	}
+	m2 := &Map[K, V]{m: m.m, alreadyLocked: true}
+	for k, v := range m.m {
+		if !f(m2, k, v) {
+			return
+		}
+	}
+	m.m = m2.m // in case a new map was allocated
+}
+
 // Len returns the length of the map.
 func (m *Map[K, V]) Len() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	if !m.alreadyLocked {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+	}
 	return len(m.m)
 }
 
