@@ -196,6 +196,8 @@ func writePromExpVar(w io.Writer, prefix string, kv expvar.KeyValue) {
 		v.Do(func(kv expvar.KeyValue) {
 			fmt.Fprintf(w, "%s{%s=%q} %v\n", name, v.Label, kv.Key, kv.Value)
 		})
+	case *metrics.Histogram:
+		v.PromExport(w, name)
 	case *expvar.Map:
 		if label != "" && typ != "" {
 			fmt.Fprintf(w, "# TYPE %s %s\n", name, typ)
