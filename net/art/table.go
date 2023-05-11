@@ -22,6 +22,11 @@ import (
 	"sync"
 )
 
+const (
+	debugInsert = false
+	debugDelete = false
+)
+
 // Table is an IPv4 and IPv6 routing table.
 type Table[T any] struct {
 	v4       strideTable[T]
@@ -114,217 +119,369 @@ func (t *Table[T]) Insert(pfx netip.Prefix, val *T) {
 	if val == nil {
 		panic("Table.Insert called with nil value")
 	}
+
+	if debugInsert {
+		defer func() {
+			fmt.Printf("%s", t.debugSummary())
+		}()
+	}
+
+	// The standard library doesn't enforce normalized prefixes (where
+	// the non-prefix bits are all zero). Our algorithms all require
+	// normalized prefixes though, so do it upfront.
+	pfx = pfx.Masked()
+
+	if debugInsert {
+		fmt.Printf("\ninsert: start pfx=%s\n", pfx)
+	}
+
 	st := &t.v4
 	if pfx.Addr().Is6() {
 		st = &t.v6
 	}
-	bs := pfx.Addr().AsSlice()
-	i := 0
-	numBits := pfx.Bits()
 
-	// The strideTable we want to insert into is potentially at the end of a
-	// chain of strideTables, each one encoding successive 8 bits of the prefix.
+	// This algorithm is full of off-by-one headaches that boil down
+	// to the fact that pfx.Bits() has (2^n)+1 values, rather than
+	// just 2^n. For example, an IPv4 prefix length can be 0 through
+	// 32, which is 33 values.
 	//
-	// We're expecting to walk down a path of tables, although with prefix
-	// compression we may end up skipping some links in the chain, or taking
-	// wrong turns and having to course correct.
-	//
-	// When this loop exits, st points to the strideTable to insert into;
-	// numBits is the prefix length to insert in the strideTable (0-8), and i is
-	// the index into bs of the address byte containing the final numBits bits
-	// of the prefix.
-	fmt.Printf("process %s i=%d numBits=%d\n", pfx, i, numBits)
-findLeafTable:
-	for numBits > 8 {
-		fmt.Printf("find %s i=%d numBits=%d\n", pfx, i, numBits)
-		child, created := st.getOrCreateChild(bs[i])
-
-		// At each step of our path through strideTables, one of three things
-		// can happen:
-		switch {
-		case created:
-			// The path we were on for our prefix stopped at a dead end, a
-			// subtree we need doesn't exist. The rest of the path, if we were
-			// to create it, will consist of a bunch of tables with a single
-			// child. We can use path compression to elide those intermediates,
-			// and jump straight to the final strideTable that hosts this
-			// prefix.
-			if pfx.Bits() == pfx.Addr().BitLen() {
-				i = len(bs) - 1
-				numBits = 8
-			} else {
-				i = pfx.Bits() / 8
-				numBits = pfx.Bits() % 8
-			}
-			child.prefix = mustPrefix(pfx.Addr(), i*8)
-			st = child
-			fmt.Printf("created child table, i=%d numBits=%d childPrefix=%s\n", i, numBits, child.prefix)
-			break findLeafTable
-		case !prefixIsChild(child.prefix, pfx):
-			fmt.Printf("wrong way, child.prefix=%s pfx=%s\n", child.prefix, pfx)
-			// A child exists, but its prefix is not a parent of pfx. This means
-			// that this subtree was compressed in service of a different
-			// prefix, and we are missing an intermediate strideTable that
-			// differentiates our desired path and the path we've currently
-			// ended up on.
-			//
-			// We can fix this by inserting an intermediate strideTable that
-			// represents the first non-equal byte of the two prefixes.
-			// Effectively, we decompress the existing path, insert pfx (which
-			// creates a new, different subtree somewhere), then recompress the
-			// entire subtree to end up with 3 strideTables: the one we just
-			// found, the leaf table we need for pfx, and a common parent that
-			// distinguishes the two.
-			intermediatePrefix, addrOfExisting, addrOfNew := computePrefixSplit(child.prefix, pfx)
-			intermediate := &strideTable[T]{prefix: intermediatePrefix}
-			st.setChild(bs[i], intermediate)
-			intermediate.setChild(addrOfExisting, child)
-
-			// Is the new intermediate we just made the final resting
-			// insertion point for the new prefix? It could either
-			// belong in intermediate, or in a new child of
-			// intermediate.
-			if remain := pfx.Bits() - intermediate.prefix.Bits(); remain <= 8 {
-				// pfx belongs directly in intermediate.
-				i = pfx.Bits() / 8
-				if pfx.Bits()%8 == 0 && pfx.Bits() != 0 {
-					i--
-				}
-				numBits = remain
-				st = intermediate
-				fmt.Printf("pfx directly in intermediate, %d into %s\n", bs[i], st.prefix)
-				break findLeafTable
-			}
-
-			// Otherwise, we need a new child subtree hanging off the
-			// intermediate. By definition this subtree doesn't exist
-			// yet, which means we can fully compress it and jump from
-			// the intermediate straight to the final stride that pfx
-			// needs.
-			st, created = intermediate.getOrCreateChild(addrOfNew)
-			if !created {
-				panic("new child path unexpectedly exists during path decompression")
-			}
-			// Having now created a new child for our prefix, we're back in the
-			// previous case: the rest of the path definitely doesn't exist,
-			// since we just made it. We just need to set up the new leaf table
-			// and get it ready for final insertion.
-			if pfx.Bits() == pfx.Addr().BitLen() {
-				i = len(bs) - 1
-				numBits = 8
-			} else {
-				i = pfx.Bits() / 8
-				numBits = pfx.Bits() % 8
-			}
-			st.prefix = mustPrefix(pfx.Addr(), i*8)
-			fmt.Printf("created intermediate table, i=%d numBits=%d intermediate=%s childPrefix=%s\n", i, numBits, intermediate.prefix, st.prefix)
-			break findLeafTable
-		default:
-			// An expected child table exists along pfx's path. Continue traversing
-			// downwards, or exit the loop if we run out of prefix bits and this
-			// child is the leaf we should insert into.
-			st = child
-			i++
-			numBits -= 8
-			fmt.Printf("walking down, i=%d numBits=%d childPrefix=%s\n", i, numBits, st.prefix)
+	// This extra possible value creates all kinds of headaches as we
+	// do bits and bytes math to traverse strideTables below. So, we
+	// treat the default route 0/0 specially here, that way the rest
+	// of the logic goes back to having 2^n values to reason about,
+	// which can be done in a nice and regular fashion with no edge
+	// cases.
+	if pfx.Bits() == 0 {
+		if debugInsert {
+			fmt.Printf("insert: default route\n")
 		}
+		st.insert(0, 0, val)
+		return
 	}
 
-	fmt.Printf("inserting %s i=%d numBits=%d\n\n", pfx, i, numBits)
-	// Finally, insert the remaining 0-8 bits of the prefix into the child
-	// table.
-	st.insert(bs[i], numBits, val)
+	bs := pfx.Addr().AsSlice()
+
+	// No matter what we do as we traverse strideTables, our final
+	// action will be to insert the last 1-8 bits of pfx into a
+	// strideTable somewhere.
+	//
+	// We calculate upfront the byte position in bs of the end of the
+	// prefix; the number of bits within that byte that contain prefix
+	// data; and the prefix owned by the strideTable into which we'll
+	// eventually insert.
+	//
+	// We need this in a couple different branches of the code below,
+	// and because the possible values are 1-indexed (1 through 32 for
+	// ipv4, 1 through 128 for ipv6), the math is very slightly
+	// unusual to account for the off-by-one indexing. Do it once up
+	// here, with this large comment, rather than reproduce the subtle
+	// math in multiple places further down.
+	finalByteIdx := (pfx.Bits() - 1) / 8
+	finalBits := pfx.Bits() - (finalByteIdx * 8)
+	finalStridePrefix := mustPrefix(pfx.Addr(), finalByteIdx*8)
+	if debugInsert {
+		fmt.Printf("insert: finalByteIdx=%d finalBits=%d finalStridePrefix=%s\n", finalByteIdx, finalBits, finalStridePrefix)
+	}
+
+	// The strideTable we want to insert into is potentially at the
+	// end of a chain of strideTables, each one encoding 8 bits of the
+	// prefix.
+	//
+	// We're expecting to walk down a path of tables, although with
+	// prefix compression we may end up skipping some links in the
+	// chain, or taking wrong turns and having to course correct.
+	//
+	// As we walk down the tree, byteIdx is the byte of bs we're
+	// currently examining to choose our next step, and numBits is the
+	// number of bits that remain in pfx, starting with the byte at
+	// byteIdx inclusive.
+	byteIdx := 0
+	numBits := pfx.Bits()
+	for {
+		if debugInsert {
+			fmt.Printf("insert: loop byteIdx=%d numBits=%d st.prefix=%s\n", byteIdx, numBits, st.prefix)
+		}
+		if numBits <= 8 {
+			if debugInsert {
+				fmt.Printf("insert: existing leaf st.prefix=%s addr=%d/%d\n", st.prefix, bs[finalByteIdx], finalBits)
+			}
+			// We've reached the end of the prefix, whichever
+			// strideTable we're looking at now is the place where we
+			// need to insert.
+			st.insert(bs[finalByteIdx], finalBits, val)
+			return
+		}
+
+		// Otherwise, we need to go down at least one more level of
+		// strideTables. With prefix compression, each level of
+		// descent can have one of three outcomes: we find a place
+		// where prefix compression is possible; a place where prefix
+		// compression made us take a "wrong turn"; or a point along
+		// our intended path that we have to keep following.
+		child, created := st.getOrCreateChild(bs[byteIdx])
+		switch {
+		case created:
+			// The subtree we need for pfx doesn't exist yet. The rest
+			// of the path, if we were to create it, will consist of a
+			// bunch of strideTables with a single child. We can use
+			// path compression to elide those intermediates, and jump
+			// straight to the final strideTable that hosts this
+			// prefix.
+			child.prefix = finalStridePrefix
+			child.insert(bs[finalByteIdx], finalBits, val)
+			if debugInsert {
+				fmt.Printf("insert: new leaf st.prefix=%s child.prefix=%s addr=%d/%d\n", st.prefix, child.prefix, bs[finalByteIdx], finalBits)
+			}
+			return
+		case child.prefix == pfx:
+			// Edge case, /16 vs. /24
+			// Still fucked, rerun TestDeleteCompare to figure out why
+			intermediatePrefix, _ := pfx.Addr().Prefix(pfx.Bits() - 8)
+			intermediate := &strideTable[T]{prefix: intermediatePrefix}
+			st.setChild(bs[byteIdx], intermediate)
+			intermediate.setChild(bs[child.prefix.Bits()/8], child)
+			intermediate.insert(bs[finalByteIdx], finalBits, val)
+			return
+		case !prefixContains(child.prefix, pfx):
+			// child already exists, but its prefix does not contain
+			// pfx. This means that the path between st and child was
+			// compressed by a previous insertion, and somewhere in
+			// the (implicit) compressed path we took a wrong turn,
+			// into the wrong part of st's subtree.
+			//
+			// This is okay, because pfx and child.prefix must have a
+			// common ancestor node somewhere between st and child. We
+			// can figure out what node that is, materialize it
+			// between st and child, and resume from there.
+			intermediatePrefix, addrOfExisting, addrOfNew := computePrefixSplit(child.prefix, pfx)
+			intermediate := &strideTable[T]{prefix: intermediatePrefix} // TODO: make this whole thing be st.AddIntermediate or something?
+			st.setChild(bs[byteIdx], intermediate)
+			intermediate.setChild(addrOfExisting, child)
+
+			if debugInsert {
+				fmt.Printf("insert: new intermediate st.prefix=%s intermediate.prefix=%s child.prefix=%s\n", st.prefix, intermediate.prefix, child.prefix)
+			}
+
+			// Now, we have a chain of st -> intermediate -> child.
+			//
+			// pfx either lives in a different child of intermediate,
+			// or in intermediate itself. For example, if we created
+			// the intermediate 1.2.0.0/16, pfx=1.2.3.4/32 would have
+			// to go into a new child of intermediate, but
+			// pfx=1.2.0.0/18 would go into intermediate directly.
+			if remain := pfx.Bits() - intermediate.prefix.Bits(); remain <= 8 {
+				if debugInsert {
+					fmt.Printf("insert: into intermediate intermediate.prefix=%s addr=%d/%d\n", intermediate.prefix, bs[finalByteIdx], finalBits)
+				}
+				// pfx lives in intermediate.
+				intermediate.insert(bs[finalByteIdx], finalBits, val)
+			} else {
+				// pfx lives in a different child subtree of
+				// intermediate. By definition this subtree doesn't
+				// exist at all, otherwise we'd never have entereed
+				// this entire "wrong turn" codepath in the first
+				// place.
+				//
+				// This means we can apply prefix compression as we
+				// create this new child, and we're done.
+				st, created = intermediate.getOrCreateChild(addrOfNew)
+				if !created {
+					panic("new child path unexpectedly exists during path decompression")
+				}
+				st.prefix = finalStridePrefix
+				st.insert(bs[finalByteIdx], finalBits, val)
+				if debugInsert {
+					fmt.Printf("insert: new child st.prefix=%s addr=%d/%d\n", st.prefix, bs[finalByteIdx], finalBits)
+				}
+			}
+			return
+		default:
+			// An expected child table exists along pfx's
+			// path. Continue traversing downwards.
+			st = child
+			byteIdx = child.prefix.Bits() / 8
+			numBits = pfx.Bits() - child.prefix.Bits()
+			if debugInsert {
+				fmt.Printf("insert: descend st.prefix=%s\n", st.prefix)
+			}
+		}
+	}
 }
 
 // Delete removes pfx from the table, if it is present.
 func (t *Table[T]) Delete(pfx netip.Prefix) {
 	t.init()
+
+	// The standard library doesn't enforce normalized prefixes (where
+	// the non-prefix bits are all zero). Our algorithms all require
+	// normalized prefixes though, so do it upfront.
+	pfx = pfx.Masked()
+
+	if debugDelete {
+		defer func() {
+			fmt.Printf("%s", t.debugSummary())
+		}()
+		fmt.Printf("\ndelete: start pfx=%s table:\n%s", pfx, t.debugSummary())
+	}
+
 	st := &t.v4
 	if pfx.Addr().Is6() {
 		st = &t.v6
 	}
-	bs := pfx.Addr().AsSlice()
-	i := 0
-	numBits := pfx.Bits()
 
-	// Deletion may drive the refcount of some strideTables down to zero. We
-	// need to clean up these dangling tables, so we have to keep track of which
-	// tables we touch on the way down, and which strideEntry index each child
-	// is registered in.
+	// Deletion may drive the refcount of some strideTables down to
+	// zero. We need to clean up these dangling tables, so we have to
+	// keep track of which tables we touch on the way down, and which
+	// strideEntry index each child is registered in.
 	strideIdx := 0
 	strideTables := [16]*strideTable[T]{st}
 	strideIndexes := [16]int{}
 
-	// Similar to Insert, navigate down the tree of strideTables, looking for
-	// the one that houses this prefix. This part is easier than with insertion,
-	// since we can bail if the path ends early or takes an unexpected detour.
-	// However, unlike insertion, there's a whole post-deletion cleanup phase
-	// later on.
+	// Similar to Insert, navigate down the tree of strideTables,
+	// looking for the one that houses this prefix. This part is
+	// easier than with insertion, since we can bail if the path ends
+	// early or takes an unexpected detour.  However, unlike
+	// insertion, there's a whole post-deletion cleanup phase later
+	// on.
+	//
+	// As we walk down the tree, byteIdx is the byte of bs we're
+	// currently examining to choose our next step, and numBits is the
+	// number of bits that remain in pfx, starting with the byte at
+	// byteIdx inclusive.
+	bs := pfx.Addr().AsSlice()
+	byteIdx := 0
+	numBits := pfx.Bits()
 	for numBits > 8 {
-		child, idx := st.getChild(bs[i])
+		if debugDelete {
+			fmt.Printf("delete: loop byteIdx=%d numBits=%d st.prefix=%s\n", byteIdx, numBits, st.prefix)
+		}
+		child, idx := st.getChild(bs[byteIdx])
 		if child == nil {
 			// Prefix can't exist in the table, one of the necessary
 			// strideTables doesn't exist.
+			if debugDelete {
+				fmt.Printf("delete: missing needed child pfx=%s\n", pfx)
+			}
 			return
 		}
 		// Note that the strideIndex and strideTables entries are off-by-one.
 		// The child table pointer is recorded at i+1, but it is referenced by a
 		// particular index in the parent table, at index i.
 		strideIndexes[strideIdx] = idx
+		strideTables[strideIdx+1] = child
 		strideIdx++
-		strideTables[strideIdx] = child
-		i = child.prefix.Bits() / 8
+
+		// Path compression means byteIdx can jump forwards
+		// unpredictably. Recompute the next byte to look at from the
+		// child we just found.
+		byteIdx = child.prefix.Bits() / 8
 		numBits = pfx.Bits() - child.prefix.Bits()
 		st = child
+
+		if debugDelete {
+			fmt.Printf("delete: descend st.prefix=%s\n", st.prefix)
+		}
 	}
 
-	// We reached a leaf stride table that seems to be in the right spot. But
-	// path compression might have led us to the wrong table. Or, we might be in
-	// the right place, but the strideTable just doesn't contain the prefix at
-	// all.
-	if !prefixIsChild(st.prefix, pfx) {
-		// Wrong table, the requested prefix can't exist since its path led us
-		// to the wrong place.
+	// We reached a leaf stride table that seems to be in the right
+	// spot. But path compression might have led us to the wrong
+	// table. Or, we might be in the right place, but the strideTable
+	// just doesn't contain the prefix at all.
+	if !prefixContains(st.prefix, pfx) {
+		// Wrong table, the requested prefix can't exist since its
+		// path led us to the wrong place.
+		if debugDelete {
+			fmt.Printf("delete: wrong leaf table pfx=%s\n", pfx)
+		}
 		return
 	}
-	if st.delete(bs[i], numBits) == nil {
-		// We're in the right strideTable, but pfx wasn't in it. Refcount hasn't
-		// changed, so no need to run through cleanup.
+	if debugDelete {
+		fmt.Printf("delete: delete from st.prefix=%s addr=%d/%d\n", st.prefix, bs[byteIdx], numBits)
+	}
+	if st.delete(bs[byteIdx], numBits) == nil {
+		// We're in the right strideTable, but pfx wasn't in
+		// it. Refcounts haven't changed, so no need to run through
+		// cleanup.
+		if debugDelete {
+			fmt.Printf("delete: prefix not present pfx=%s\n", pfx)
+		}
 		return
 	}
 
 	// st.delete reduced st's refcount by one. This table may now be
-	// reclaimable, and depending on how we can reclaim it, the parent tables
-	// may also need to be considered for reclamation. This loop ends as soon as
-	// take no action, or take an action that doesn't alter the parent table's
-	// refcounts.
-	for i > 0 {
-		if strideTables[i].routeRefs > 0 {
-			// the strideTable has route entries, it cannot be deleted or
-			// compacted.
+	// reclaimable, and depending on how we can reclaim it, the parent
+	// tables may also need to be considered for reclamation. This
+	// loop ends as soon as an iteration takes no action, or takes an
+	// action that doesn't alter the parent table's refcounts.
+	//
+	// We start our walk back at strideTables[strideIdx], which
+	// contains st.
+	for strideIdx > 0 {
+		cur := strideTables[strideIdx]
+		if debugDelete {
+			fmt.Printf("delete: GC strideIdx=%d st.prefix=%s\n", strideIdx, cur.prefix)
+		}
+		if cur.routeRefs > 0 {
+			// the strideTable has route entries, it cannot be deleted
+			// or compacted.
+			if debugDelete {
+				fmt.Printf("delete: has other routes st.prefix=%s\n", cur.prefix)
+			}
 			return
 		}
-		switch strideTables[i].childRefs {
+		switch cur.childRefs {
 		case 0:
-			// no routeRefs and no childRefs, this table can be deleted. This
-			// will alter the parent table's refcount, so we'll have to look at
-			// it as well (in the next loop iteration).
-			strideTables[i-1].deleteChild(strideIndexes[i-1])
-			i--
+			// no routeRefs and no childRefs, this table can be
+			// deleted. This will alter the parent table's refcount,
+			// so we'll have to look at it as well (in the next loop
+			// iteration).
+			if debugDelete {
+				fmt.Printf("delete: remove st.prefix=%s\n", cur.prefix)
+			}
+			strideTables[strideIdx-1].deleteChild(strideIndexes[strideIdx-1])
+			strideIdx--
 		case 1:
-			// This table has no routes, and a single child. Compact this table
-			// out of existence by making the parent point directly at the
-			// child. This does not affect the parent's refcounts, so the parent
-			// can't be eligible for deletion or compaction, and we can stop.
-			strideTables[i-1].setChildByIdx(strideIndexes[i-1], strideTables[i].findFirstChild())
+			// This table has no routes, and a single child. Compact
+			// this table out of existence by making the parent point
+			// directly at the one child. This does not affect the
+			// parent's refcounts, so the parent can't be eligible for
+			// deletion or compaction, and we can stop.
+			child := strideTables[strideIdx].findFirstChild()
+			parent := strideTables[strideIdx-1]
+			if debugDelete {
+				fmt.Printf("delete: compact parent.prefix=%s st.prefix=%s child.prefix=%s\n", parent.prefix, cur.prefix, child.prefix)
+			}
+			strideTables[strideIdx-1].setChildByIdx(strideIndexes[strideIdx-1], child)
 			return
 		default:
 			// This table has two or more children, so it's acting as a "fork in
 			// the road" between two prefix subtrees. It cannot be deleted, and
 			// thus no further cleanups are possible.
+			if debugDelete {
+				fmt.Printf("delete: fork table st.prefix=%s\n", cur.prefix)
+			}
 			return
 		}
 	}
+}
+
+func (t *Table[T]) numStrides() int {
+	seen := map[*strideTable[T]]bool{}
+	return t.numStridesRec(seen, &t.v4) + t.numStridesRec(seen, &t.v6)
+}
+
+func (t *Table[T]) numStridesRec(seen map[*strideTable[T]]bool, st *strideTable[T]) int {
+	ret := 1
+	if st.childRefs == 0 {
+		return ret
+	}
+	for i := firstHostIndex; i <= lastHostIndex; i++ {
+		if c := st.entries[i].child; c != nil && !seen[c] {
+			seen[c] = true
+			ret += t.numStridesRec(seen, c)
+		}
+	}
+	return ret
 }
 
 // debugSummary prints the tree of allocated strideTables in t, with each
@@ -333,26 +490,26 @@ func (t *Table[T]) debugSummary() string {
 	t.init()
 	var ret bytes.Buffer
 	fmt.Fprintf(&ret, "v4: ")
-	strideSummary(&ret, &t.v4, 0)
+	strideSummary(&ret, &t.v4, 4)
 	fmt.Fprintf(&ret, "v6: ")
-	strideSummary(&ret, &t.v6, 0)
+	strideSummary(&ret, &t.v6, 4)
 	return ret.String()
 }
 
 func strideSummary[T any](w io.Writer, st *strideTable[T], indent int) {
 	fmt.Fprintf(w, "%s: %d routes, %d children\n", st.prefix, st.routeRefs, st.childRefs)
-	indent += 2
+	indent += 4
 	st.treeDebugStringRec(w, 1, indent)
 	for i := firstHostIndex; i <= lastHostIndex; i++ {
 		if child := st.entries[i].child; child != nil {
 			addr, len := inversePrefixIndex(i)
-			fmt.Fprintf(w, "%s%d/%d: ", strings.Repeat(" ", indent), addr, len)
+			fmt.Fprintf(w, "%s%d/%d (%02x/%d): ", strings.Repeat(" ", indent), addr, len, addr, len)
 			strideSummary(w, child, indent)
 		}
 	}
 }
 
-func prefixIsChild(parent, child netip.Prefix) bool {
+func prefixContains(parent, child netip.Prefix) bool {
 	return parent.Overlaps(child) && parent.Bits() < child.Bits()
 }
 
@@ -375,18 +532,14 @@ func computePrefixSplit(a, b netip.Prefix) (lastCommon netip.Prefix, aStride, bS
 	if a.Addr().Is4() != b.Addr().Is4() {
 		panic("computePrefixSplit called with mismatched address families")
 	}
-	fmt.Printf("split: %s vs. %s\n", a, b)
 
 	minPrefixLen := a.Bits()
 	if b.Bits() < minPrefixLen {
 		minPrefixLen = b.Bits()
 	}
-	fmt.Printf("maxbits=%d\n", minPrefixLen)
 
 	commonStrides := commonStrides(a.Addr(), b.Addr(), minPrefixLen)
-	fmt.Printf("commonstrides=%d\n", commonStrides)
 	lastCommon, err := a.Addr().Prefix(commonStrides * 8)
-	fmt.Printf("lastCommon=%s\n", lastCommon)
 	if err != nil {
 		panic(fmt.Sprintf("computePrefixSplit constructing common prefix: %v", err))
 	}
@@ -397,7 +550,6 @@ func computePrefixSplit(a, b netip.Prefix) (lastCommon netip.Prefix, aStride, bS
 		aStride = a.Addr().As16()[commonStrides]
 		bStride = b.Addr().As16()[commonStrides]
 	}
-	fmt.Printf("aStride=%d, bStride=%d\n", aStride, bStride)
 	return lastCommon, aStride, bStride
 }
 
